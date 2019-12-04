@@ -1,0 +1,291 @@
+#include <iostream>
+#include <functional>
+
+#include "rbdyn_helper.h"
+
+#include <RBDyn/Body.h>
+#include <RBDyn/FK.h>
+#include <RBDyn/FV.h>
+#include <RBDyn/Joint.h>
+#include <RBDyn/Jacobian.h>
+
+#include <rbdyn-parsers/urdf.h>
+
+#include <pid/rpath.h>
+#include <yaml-cpp/yaml.h>
+#include <chrono>
+
+RbdynHelper::RbdynHelper(const std::string& urdf_file) {
+  std::tie(mb, mbc, mbg) = rbd::RBDynFromURDF(urdf_file, rbd::ParserInput::File);
+  getAllBodiesName();
+  getAllJointNames();
+  getJointIndex();
+  init_FK();
+  load_camera_parameters();
+  initialize_joints();
+}
+
+void RbdynHelper::initialize_joints()
+{
+    auto config = YAML::LoadFile(PID_PATH("app_config/camera-projection.yaml"));
+    index = config["optim"]["upper_body_joints"].as<std::vector<double>>();
+    Upper_params = arma::zeros<arma::vec>(index.size());
+}
+
+double RbdynHelper::pose_func(const arma::vec& vals_inp, arma::vec* grad_out, void* opt_data)
+{
+  auto compute_cost =
+  [this](const arma::vec& vals_inp) -> double {
+    Update_FK(vals_inp); // Upper_params
+    cv::Mat new_image_points = Camera_Projection(cv3points);
+    count++;
+
+    double obj_val = cv::norm(new_image_points, pose2d, cv::NORM_L2);
+    if(obj_val < 1e-1){
+
+      std::cout << "Iterations: " << count << std::endl;
+      std::cout << "Norm is: \n" << obj_val << std::endl;
+      std::cout << "Angle Vector: \n" << vals_inp << std::endl;
+
+    }
+    return obj_val;
+  };
+
+  if(grad_out) {
+    auto f0 = compute_cost(vals_inp);
+    arma::vec x_plus_eps;
+    for (size_t i = 0; i < index.size(); ++i) {
+      x_plus_eps = vals_inp;
+      x_plus_eps[i] += 1e-12;
+      auto f1 = compute_cost(x_plus_eps);
+      (*grad_out)[i] = (f1 - f0) / 1e-12;
+    }
+  }
+
+  return compute_cost(vals_inp);
+}
+
+void RbdynHelper::optim_prob(){
+  // >>> Optim
+  auto config = YAML::LoadFile(PID_PATH("app_config/camera-projection.yaml"));
+
+  optim::algo_settings_t settings;
+  //
+  // settings.pso_inertia_method = 1;
+  // settings.pso_velocity_method = 1;
+  settings.pso_center_particle = false;
+  settings.err_tol = config["optim"]["err_tol"].as<double>();
+  settings.pso_n_pop = config["optim"]["pso_n_pop"].as<double>();
+  settings.pso_n_gen = config["optim"]["pso_n_gen"].as<double>();
+  // settings.pso_par_c_cog = config["optim"]["pso_par_c_cog"].as<double>();
+  // settings.pso_par_c_soc = config["optim"]["pso_par_c_soc"].as<double>();
+  // settings.pso_par_initial_c_cog = config["optim"]["pso_par_initial_c_cog"].as<double>();
+  // settings.pso_par_final_c_cog   = config["optim"]["pso_par_final_c_cog"].as<double>();
+  // settings.pso_par_initial_c_soc = config["optim"]["pso_par_initial_c_soc"].as<double>();
+  // settings.pso_par_final_c_soc   = config["optim"]["pso_par_final_c_soc"].as<double>();
+  // settings.pso_par_w_min = config["optim"]["pso_par_w_min"].as<double>();
+  // settings.pso_par_w_max = config["optim"]["pso_par_w_max"].as<double>();
+  settings.vals_bound = true;
+  //
+  std::vector<double> lower_bounds_all = config["optim"]["lower_bounds"].as<std::vector<double>>();
+  std::vector<double> upper_bounds_all = config["optim"]["upper_bounds"].as<std::vector<double>>();
+  std::vector<double> lowerbounds, upperbounds, init_lower, init_upper;
+
+  for (int i = 0; i < index.size(); i++){
+    lowerbounds.push_back(lower_bounds_all[index[i]]);
+    init_lower.push_back(lower_bounds_all[index[i]]);
+    upperbounds.push_back(upper_bounds_all[index[i]]);
+    init_upper.push_back(upper_bounds_all[index[i]]);
+  }
+
+  settings.lower_bounds = lowerbounds;
+  settings.upper_bounds = upperbounds;
+  settings.pso_initial_lb = init_lower;
+  settings.pso_initial_ub = init_upper;
+
+  using namespace std::placeholders;
+  // bool success = optim::de(x_1, std::bind(&RbdynHelper::bukin_fn, this, _1, _2, _3), nullptr, settings);
+  auto start_time = std::chrono::high_resolution_clock::now();
+  bool success = optim::pso(Upper_params, std::bind(&RbdynHelper::pose_func, this, _1, _2, _3), nullptr, settings);
+  if (success) {
+      std::cout << "pso: optimization success." << std::endl;
+  } else {
+      std::cout << "pso: optimization unsuccess." << std::endl;
+  }
+  auto time_elap = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> Time_Elapsed = time_elap - start_time;
+
+  double return_val;
+  return_val = settings.opt_value;
+  // arma::cout << "de: solution to Bukin test:\n" << x_1 << arma::endl;
+
+  std::cout << "Return Value from Optimization Algorithm is: " << return_val << std::endl;
+  std::cout << "Time Elapsed in optimization: " << (int)Time_Elapsed.count() << " ms" << std::endl;
+  for (int i = 0; i < index.size(); i++)
+    std::cout << Upper_params[i] << std::endl;
+  // <<< Optim
+}
+
+sva::PTransformd RbdynHelper::relativeTransform(const std::string & object, const std::string & relativeTo) const {
+   // X_rel_o = X_0_o * X_rel_0
+   return  mbc.bodyPosW[mb.bodyIndexByName(object)] *
+           mbc.bodyPosW[mb.bodyIndexByName(relativeTo)].inv();
+}
+
+double& RbdynHelper::getAngle(const std::string& name) {
+  return mbc.q[mb.jointIndexByName(name)][0];
+}
+
+double& RbdynHelper::getAngle(size_t index) {
+  return mbc.q[index][0];
+}
+
+void RbdynHelper::getJointIndex() {
+  for(int i = 0; i < joint_names.size(); i++)
+    Joint_Indices.push_back(mb.jointIndexByName(joint_names[i]));
+}
+
+const std::vector<sva::PTransformd>& RbdynHelper::getAllBodiesPose() const {
+    return mbc.bodyPosW;
+}
+
+void RbdynHelper::init_FK(void){
+
+  for (int i = 0 ; i < body_names.size() ; i ++)
+    Body_Poses.push_back(mbc.bodyPosW[mb.bodyIndexByName(body_names[i])]);
+  // Body_Poses = getAllBodiesPose();
+  rbd::forwardKinematics(mb, mbc);
+  for (int i = 0 ; i < body_names.size() ; i ++){
+    positions.push_back(Body_Poses[i].translation());
+    rotations.push_back(Body_Poses[i].rotation());
+    cv::Mat Temp_Mat(3,1,CV_64FC1, positions[i].data());
+    cv3points.push_back(cv::Point3d(Temp_Mat));
+  }
+}
+
+void RbdynHelper::Update_FK(arma::vec Upper_params){
+  // New temporary change
+  // for (int i = 0; i < Joint_Indices.size(); i++)
+
+  for (int i = 0; i < static_cast<int>(Upper_params.size()); i++)
+  {
+    getAngle(Joint_Indices[index[i]]) = Upper_params[i];
+  }
+  rbd::forwardKinematics(mb, mbc);
+  for (int i = 0 ; i < body_names.size() ; i ++){
+    Body_Poses[i] = mbc.bodyPosW[mb.bodyIndexByName(body_names[i])];
+    positions[i] = Body_Poses[i].translation();
+    rotations[i] = Body_Poses[i].rotation();
+    cv::Mat Temp_Mat(3,1,CV_64FC1, positions[i].data());
+    cv3points[i] = cv::Point3d(Temp_Mat);
+  }
+  }
+
+void RbdynHelper::load_camera_parameters(void){
+  cv::String camera_matrix_file = "/home/osama/Programs/stereo-calibration/build/Kinect.yml";
+  cv::FileStorage fs(camera_matrix_file, cv::FileStorage::READ);
+
+  fs["K"] >> K_Mat;
+  fs["D"] >> D_Mat;
+
+  fs.release();
+
+  rVec.at<double>(0) = 0;
+  rVec.at<double>(1) = -1.5707963;
+  rVec.at<double>(2) = 0;
+
+  tVec.at<double>(0) = -0.4;
+  tVec.at<double>(1) = 0;
+  tVec.at<double>(2) = 1.5;
+}
+
+cv::Mat RbdynHelper::Camera_Projection(std::vector<cv::Point3d> objectPoints){
+  cv::projectPoints(objectPoints, rVec, tVec, K_Mat, D_Mat, imagePoints);
+  cv::Mat image_points_mat = cv::Mat(15,2,CV_64F,imagePoints.data());
+  return image_points_mat;
+}
+
+void RbdynHelper::draw_skeleton(cv::Mat image_for_skeleton, cv::Mat * image_with_skeleton, std::vector<cv::Point2d> imagePoints)
+{
+  for (unsigned int i = 0; i < imagePoints.size(); ++i)
+    cv::circle(image_for_skeleton, cv::Point(imagePoints[i].y, imagePoints[i].x), 5, cv::Scalar(0,0,255), -1);
+  // >>> *
+  unsigned int joint_indices[14] = {1, 2, 6 ,10, 4, 8, 3, 11, 5, 12, 7, 13, 9, 14};
+  unsigned int count = 0;
+  bool one_time = true;
+  for (unsigned int i = 0; i < 10; ++i){
+    if(count < 4)
+      i = 0;
+    if(i == 2 && one_time == true){
+      i = 1;
+      one_time = false;
+    }
+    cv::line(image_for_skeleton, cv::Point(imagePoints[i].y, imagePoints[i].x), cv::Point(imagePoints[joint_indices[count]].y,  imagePoints[joint_indices[count]].x),  cv::Scalar(0,255,0), 2, -1);
+    count ++;
+  }
+
+  *image_with_skeleton = image_for_skeleton;
+}
+
+void RbdynHelper::Display_Projection(std::vector<cv::Point2d> imagePoints){
+  cv::Mat Image_plane = cv::Mat::zeros( 1080, 1920, CV_8UC3 );
+  cv::Mat Image_with_skeleton;
+  draw_skeleton(Image_plane, &Image_with_skeleton, imagePoints);
+
+  cv::namedWindow("Image Plane", cv::WINDOW_NORMAL);
+  cv::imshow("Image Plane", Image_with_skeleton);
+  cv::waitKey(1);
+}
+
+void RbdynHelper::getAllBodiesName() {
+  body_names.push_back("main_neck");           // 0
+  body_names.push_back("main_trunk");          // 1
+  body_names.push_back("main_left_shoulder");  //  2
+  body_names.push_back("main_left_elbow");     //  3
+  body_names.push_back("main_left_hip");       //  4
+  body_names.push_back("main_left_knee");      //  5
+  body_names.push_back("main_right_shoulder"); //  6
+  body_names.push_back("main_right_elbow");    //  7
+  body_names.push_back("main_right_hip");      //  8
+  body_names.push_back("main_right_knee");     //  9
+  body_names.push_back("nose");                //  10
+  body_names.push_back("left_wrist_base");     //  11
+  body_names.push_back("left_ankle_base");     //  12
+  body_names.push_back("right_wrist_base");    //  13
+  body_names.push_back("right_ankle_base");    //  14
+}
+
+// 6, 8, 9, 12, 15
+// 7, 9, 10, 13, 16
+void RbdynHelper::getAllJointNames() {
+  joint_names.push_back("hip_base_x");       // 0
+  joint_names.push_back("hip_base_y");       // 1
+  joint_names.push_back("hip_base_z");       // 2
+  joint_names.push_back("neck_x");           // 3
+  joint_names.push_back("neck_y");           // 4
+  joint_names.push_back("neck_z");           // 5   // skip it
+  joint_names.push_back("left_shoulder_x");  // 6
+  joint_names.push_back("left_shoulder_y");  // 7
+  joint_names.push_back("left_shoulder_z");  // 8
+  joint_names.push_back("left_elbow_x");     // 9
+  joint_names.push_back("left_elbow_y");     // 10  // skip it
+  joint_names.push_back("left_elbow_z");     // 11  // skip it
+  joint_names.push_back("right_shoulder_x"); // 12
+  joint_names.push_back("right_shoulder_y"); // 13
+  joint_names.push_back("right_shoulder_z"); // 14
+  joint_names.push_back("right_elbow_x");    // 15
+  joint_names.push_back("right_elbow_y");    // 16  // skip it
+  joint_names.push_back("right_elbow_z");    // 17  // skip it
+  joint_names.push_back("left_hip_x");       // 18
+  joint_names.push_back("left_hip_y");       // 19
+  joint_names.push_back("left_hip_z");       // 21
+  joint_names.push_back("right_hip_x");      // 23
+  joint_names.push_back("right_hip_y");      // 20
+  joint_names.push_back("right_hip_z");      // 22
+  joint_names.push_back("left_knee_x");      // 24
+  joint_names.push_back("left_knee_y");      // 25
+  joint_names.push_back("left_knee_z");      // 27
+  joint_names.push_back("right_knee_y");     // 26
+  joint_names.push_back("right_knee_z");     // 28
+  joint_names.push_back("right_knee_x");     // 29
+}

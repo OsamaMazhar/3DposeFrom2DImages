@@ -1,0 +1,28 @@
+optim:
+  lower_bounds: [ -0.349066, -0.785398, -1.57079632679,
+                  -1.57079632679, -0.785398, -1.57079632679,
+                  -2.35619, 0.0, -2.35619, 0.0, 0.0, 0.0,
+                  -2.35619, 0.0, 0.0, 0.0, 0.0, 0.0,
+                  -1.0472, 0.0, -0.349066, -1.0472, 0.0,
+                  -0.349066, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  upper_bounds: [ 0.349066, 1.57079632679, 1.57079632679,
+                  1.57079632679, 1.57079632679, 1.57079632679,
+                  2.35619, 2.35619, 0.0, 1.57079632679,
+                  0.0, 0.0, 2.35619, 2.35619, 2.35619,
+                  1.57079632679, 0.0, 0.0, 1.0472, 2.79253,
+                  0.349066, 1.0472, 2.79253, 0.349066, 0.0,
+                  2.35619, 0.0, 0.0, 2.35619, 0.0]
+  joints_taken: [ hip_base_x,
+                  neck_x, neck_y,
+                  left_shoulder_x, left_shoulder_y, left_shoulder_z,
+                  left_elbow_x,
+                  right_shoulder_x, right_shoulder_y, right_shoulder_z,
+                  right_elbow_x,
+                  left_hip_x,
+                  right_hip_x,
+                  left_hip_y,
+                  right_hip_y,
+                  left_knee_y,
+                  right_knee_y
+                  ]
+  Pose_file: "pose_files/Pose_sequence.yaml"
